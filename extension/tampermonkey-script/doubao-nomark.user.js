@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         无印豆包 - 素材提取
 // @namespace    http://tampermonkey.net/
-// @version      1.0.15
+// @version      1.0.16
 // @description  在豆包对话页面提取无水印图片/视频，支持一键下载
 // @description:en Extract watermark-free images/videos from Doubao chat pages with one-click download
 // @author       无印豆包
@@ -1012,6 +1012,33 @@
                     display: flex;
                 }
 
+                #doubao-nomark-image-preview {
+                    position: fixed;
+                    inset: 0;
+                    z-index: 10001;
+                    display: none;
+                    align-items: center;
+                    justify-content: center;
+                    padding: 16px;
+                    background: rgba(0, 0, 0, 0.86);
+                    cursor: zoom-out;
+                }
+
+                #doubao-nomark-image-preview.show {
+                    display: flex;
+                }
+
+                #doubao-nomark-image-preview img {
+                    width: auto;
+                    height: auto;
+                    max-width: calc(100vw - 32px);
+                    max-height: calc(100vh - 32px);
+                    object-fit: contain;
+                    display: block;
+                    box-shadow: 0 12px 48px rgba(0, 0, 0, 0.36);
+                    pointer-events: none;
+                }
+
                 .modal-content {
                     background: #ffffff;
                     border-radius: 12px;
@@ -1480,6 +1507,34 @@
         let batchDownloading = false;
         let batchCancelRequested = false;
         let currentDownloadTask = null;
+        let imagePreviewOverlay = null;
+
+        function closeImagePreview() {
+            if (imagePreviewOverlay) {
+                imagePreviewOverlay.classList.remove('show');
+            }
+        }
+
+        function getImagePreviewOverlay() {
+            if (imagePreviewOverlay) return imagePreviewOverlay;
+
+            imagePreviewOverlay = document.createElement('div');
+            imagePreviewOverlay.id = 'doubao-nomark-image-preview';
+            imagePreviewOverlay.innerHTML = '<img alt="图片预览">';
+            imagePreviewOverlay.addEventListener('click', closeImagePreview);
+            document.body.appendChild(imagePreviewOverlay);
+            return imagePreviewOverlay;
+        }
+
+        function showImagePreview(image) {
+            if (!image?.url) return;
+
+            const overlay = getImagePreviewOverlay();
+            const img = overlay.querySelector('img');
+            img.src = image.url;
+            img.alt = '图片预览';
+            overlay.classList.add('show');
+        }
 
         function formatDuration(sec) {
             if (!sec || sec <= 0) return '';
@@ -1618,7 +1673,7 @@
                     const resolution = (image.width && image.height) ? `${image.width} × ${image.height}` : '';
                     return `
                         <div class="media-card">
-                            <div class="media-preview">
+                            <div class="media-preview" data-type="image" data-index="${item.index}">
                                 <img src="${image.url}" alt="图片 ${item.index + 1}" loading="lazy">
                                 ${resolution ? `<div class="image-info">${resolution}</div>` : ''}
                             </div>
@@ -1721,12 +1776,18 @@
                 const checkbox = card.querySelector('.media-select');
                 if (!checkbox) return;
 
-                card.querySelector('.media-preview img')?.addEventListener('click', () => {
-                    checkbox.checked = !checkbox.checked;
-                });
-
                 card.querySelector('.video-click-top')?.addEventListener('click', () => {
                     checkbox.checked = !checkbox.checked;
+                });
+            });
+
+            mediaContainer.querySelectorAll('.media-preview img').forEach(img => {
+                img.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    const preview = img.closest('.media-preview');
+                    const index = parseInt(preview?.dataset.index || '', 10);
+                    const image = getMediaItem('image', index);
+                    showImagePreview(image);
                 });
             });
 
@@ -1806,11 +1867,13 @@
 
         closeBtn.addEventListener('click', () => {
             modal.classList.remove('show');
+            closeImagePreview();
         });
 
         modal.addEventListener('click', (e) => {
             if (e.target === modal) {
                 modal.classList.remove('show');
+                closeImagePreview();
             }
         });
 
