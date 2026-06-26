@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         无印豆包 - 素材提取
 // @namespace    http://tampermonkey.net/
-// @version      1.0.16
+// @version      1.0.17
 // @description  在豆包对话页面提取无水印图片/视频，支持一键下载
 // @description:en Extract watermark-free images/videos from Doubao chat pages with one-click download
 // @author       无印豆包
@@ -50,6 +50,44 @@
 
     function updateButtonCount() {
         setButtonCount(chatImages.length + chatVideos.length);
+    }
+
+    function normalizeImageUrl(url) {
+        return typeof url === 'string' ? url.replace(/&amp;/g, '&') : '';
+    }
+
+    function addChatImage(imageInfo, logLabel = '[无印豆包] 获取到新图片') {
+        const url = normalizeImageUrl(imageInfo?.url);
+        if (!url) return false;
+
+        const width = imageInfo.width || 0;
+        const height = imageInfo.height || 0;
+        const existingImage = chatImages.find(img => img.url === url);
+        if (existingImage) {
+            if (!existingImage.width && width) existingImage.width = width;
+            if (!existingImage.height && height) existingImage.height = height;
+            return false;
+        }
+
+        chatImages.push({ url, width, height });
+        console.log(`${logLabel}:`, url, `${width} × ${height}`);
+        updateButtonCount();
+        return true;
+    }
+
+    function getCreationImageInfo(creation) {
+        const imageData = creation?.image?.image_ori_raw;
+        if (typeof imageData === 'string') {
+            return { url: imageData, width: 0, height: 0 };
+        }
+        if (imageData && typeof imageData === 'object' && imageData.url) {
+            return {
+                url: imageData.url,
+                width: imageData.width || 0,
+                height: imageData.height || 0
+            };
+        }
+        return null;
     }
 
     function addChatVideo(videoInfo) {
@@ -247,11 +285,7 @@
                     const imageObj = display?.image?.[0];
                     if (!imageObj?.url) continue;
                     const { url, width = 0, height = 0 } = imageObj;
-                    if (!chatImages.find(img => img.url === url)) {
-                        chatImages.push({ url, width, height });
-                        console.log('[无印豆包][千问] 获取到图片:', url, `${width} × ${height}`);
-                        updateButtonCount();
-                    }
+                    addChatImage({ url, width, height }, '[无印豆包][千问] 获取到图片');
                 }
             }
         }
@@ -349,26 +383,7 @@
                     const vid = creation.video.vid;
                     getDoubaoVideoInfo(vid).then(info => addChatVideo(info));
                 }else{
-                    const imageData = creation.image?.image_ori_raw;
-                    if (imageData) {
-                        let imageUrl = '';
-                        let width = 0;
-                        let height = 0;
-
-                        if (typeof imageData === 'string') {
-                            imageUrl = imageData;
-                        } else if (typeof imageData === 'object' && imageData.url) {
-                            imageUrl = imageData.url;
-                            width = imageData.width || 0;
-                            height = imageData.height || 0;
-                        }
-
-                        if (imageUrl && !chatImages.find(img => img.url === imageUrl)) {
-                            chatImages.push({ url: imageUrl, width, height });
-                            console.log('[无印豆包] 获取到新图片:', imageUrl, `${width} × ${height}`);
-                            updateButtonCount();
-                        }
-                    }
+                    addChatImage(getCreationImageInfo(creation));
                 }
             }
         } catch (e) {
@@ -444,7 +459,7 @@
     function parseChatHistoryImages(messages) {
         if (!Array.isArray(messages)) return;
 
-        const newImages = [];
+        let addedCount = 0;
 
         try {
             for (const item of messages) {
@@ -457,24 +472,8 @@
                                 const vid = creation.video.vid;
                                 getDoubaoVideoInfo(vid).then(info => addChatVideo(info));
                             }else{
-                                const imageData = creation.image?.image_ori_raw;
-                                if (imageData) {
-                                    let imageUrl = '';
-                                    let width = 0;
-                                    let height = 0;
-
-                                    if (typeof imageData === 'string') {
-                                        imageUrl = imageData;
-                                    } else if (typeof imageData === 'object' && imageData.url) {
-                                        imageUrl = imageData.url;
-                                        width = imageData.width || 0;
-                                        height = imageData.height || 0;
-                                    }
-
-                                    if (imageUrl && !newImages.find(img => img.url === imageUrl)) {
-                                        newImages.push({ url: imageUrl, width, height });
-                                        console.log('[无印豆包] 找到图片:', imageUrl, `${width} × ${height}`);
-                                    }
+                                if (addChatImage(getCreationImageInfo(creation), '[无印豆包] 找到图片')) {
+                                    addedCount++;
                                 }
                             }
                         }
@@ -489,10 +488,8 @@
             console.log('[无印豆包] 解析消息失败:', e);
         }
 
-        if (newImages.length > 0) {
-            chatImages = newImages;
-            console.log('[无印豆包] 更新聊天图片，共', chatImages.length, '张');
-            updateButtonCount();
+        if (addedCount > 0) {
+            console.log('[无印豆包] 合并聊天图片，新增', addedCount, '张，共', chatImages.length, '张');
         }
     }
 
