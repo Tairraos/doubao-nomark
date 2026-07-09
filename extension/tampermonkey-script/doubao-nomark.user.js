@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         无印豆包 - 素材提取
 // @namespace    http://tampermonkey.net/
-// @version      1.0.17
+// @version      1.0.18
 // @description  在豆包对话页面提取无水印图片/视频，支持一键下载
 // @description:en Extract watermark-free images/videos from Doubao chat pages with one-click download
 // @author       无印豆包
@@ -35,8 +35,13 @@
     let chatVideos = [];
     let floatingBtnElement = null;
     let mountObserver = null;
+    const processedFallbackApis = new Set();
 
     const NOMARK_BUTTON_HOST_ID = 'doubao-nomark-button-host';
+    const QAAB_SALT_HEX = '4dd4c2e6b83162090e52b3c7a6733ba4'
+        + '1cb2462b829ab58a196b39db57177524'
+        + 'f49baf7f08e8d68d26a72e37c1a95a2f'
+        + '1f05a51892aef2949732b62a38aadd58';
     const NOMARK_ICON_SVG = `
         <svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24">
             <path d="M0 0h24v24H0z" fill="none" />
@@ -122,8 +127,10 @@
                     if (messages && Array.isArray(messages)) {
                         console.log('[无印豆包] 开始解析 messages，数量:', messages.length);
                         parseChatHistoryImages(messages);
+                        processDoubaoFallbackVideos(data, this.responseText);
                     } else {
                         console.warn('[无印豆包] messages 不是数组或不存在');
+                        processDoubaoFallbackVideos(data, this.responseText);
                     }
                 } catch (e) {
                     console.error('[无印豆包] XHR 解析聊天数据失败:', e);
@@ -138,6 +145,25 @@
     const originalFetch = pageWindow.fetch;
     pageWindow.fetch = async function(...args) {
         const url = args[0];
+        const requestUrl = typeof url === 'string' ? url : (url?.url || '');
+
+        if (requestUrl && requestUrl.includes('/im/chain/single')) {
+            const response = await originalFetch.apply(this, args);
+            response.clone().text().then(text => {
+                try {
+                    const data = JSON.parse(text);
+                    const messages = data?.downlink_body?.pull_singe_chain_downlink_body?.messages;
+                    if (Array.isArray(messages)) {
+                        console.log('[无印豆包] Fetch 解析 chain/single messages，数量:', messages.length);
+                        parseChatHistoryImages(messages);
+                    }
+                    processDoubaoFallbackVideos(data, text);
+                } catch (e) {
+                    console.warn('[无印豆包] Fetch chain/single 解析失败:', e);
+                }
+            }).catch(() => {});
+            return response;
+        }
 
         if (url && (typeof url === 'string') && url.includes('qianwen.com/api/v1/session/msg/list')) {
             console.log('[无印豆包] 检测到千问 session msg list 请求:', url);
@@ -235,8 +261,11 @@
                             if (line.startsWith('data: ')) {
                                 try {
                                     const jsonStr = line.substring(6);
-                                    if (jsonStr.includes('image_ori')) {
+                                    if (jsonStr.includes('image_ori') || jsonStr.includes('fallback_api')) {
                                         const data = JSON.parse(jsonStr);
+                                        if (jsonStr.includes('fallback_api')) {
+                                            processDoubaoFallbackVideos(data, jsonStr);
+                                        }
                                         if (data.event_data || data.patch_op) {
                                             parseStreamChunk(data);
                                         }
@@ -379,9 +408,7 @@
 
             for (const creation of creations) {
                 if (creation?.video) {
-                    // Handle video
-                    const vid = creation.video.vid;
-                    getDoubaoVideoInfo(vid).then(info => addChatVideo(info));
+                    handleDoubaoCreationVideo(creation);
                 }else{
                     addChatImage(getCreationImageInfo(creation));
                 }
@@ -456,6 +483,417 @@
         }
     }
 
+    function handleDoubaoCreationVideo(creation) {
+        processDoubaoFallbackVideos(creation, safeJsonStringify(creation));
+    }
+
+    function safeJsonStringify(value) {
+        try {
+            return JSON.stringify(value) || '';
+        } catch {
+            return '';
+        }
+    }
+
+    function processDoubaoFallbackVideos(json, rawBody = '') {
+        const fallbackApis = findDoubaoFallbackApis(json, rawBody);
+        if (!fallbackApis.length) return;
+
+        console.log('[无印豆包] 找到 fallback_api 数量:', fallbackApis.length);
+        removeLegacyDoubaoVideos();
+        for (const fallbackApi of fallbackApis) {
+            if (processedFallbackApis.has(fallbackApi)) continue;
+            processedFallbackApis.add(fallbackApi);
+
+            getDoubaoVideoInfoFromFallbackApi(fallbackApi)
+                .then(info => addChatVideo(info))
+                .catch(error => console.warn('[无印豆包] fallback_api 解析失败:', error));
+        }
+    }
+
+    async function getDoubaoVideoInfoFromFallbackApi(fallbackApi) {
+        const apiUrl = replaceQueryParams(fallbackApi, {
+            channel: 'no',
+            codec_type: '8',
+            logo_type: 'unwatermarked',
+        });
+
+        const payload = await requestJson(apiUrl);
+        const data = getVideoData(payload);
+        const picked = pickMainUrlEntry(data);
+        if (!picked?.token) {
+            console.warn('[无印豆包] fallback_api 未找到 main_url:', apiUrl);
+            return null;
+        }
+
+        const videoUrl = await decodeMainUrl(picked.token, findKeySeedDeep(payload));
+        if (!videoUrl) {
+            console.warn('[无印豆包] fallback_api main_url 解码失败:', apiUrl);
+            return null;
+        }
+
+        const meta = picked.entry || {};
+        console.log('[无印豆包] fallback_api 获取无水印视频成功:', videoUrl);
+        return {
+            vid: data.vid || data.video_id || meta.vid || meta.video_id || apiUrl,
+            source: 'fallback_api',
+            width: Number(meta.vwidth || meta.width || data.vwidth || data.width || 0),
+            height: Number(meta.vheight || meta.height || data.vheight || data.height || 0),
+            definition: meta.definition || data.definition || '',
+            duration: Number(meta.duration || data.duration || 0),
+            codec_type: meta.codec_type || data.codec_type || '',
+            poster_url: data.poster_url || data.poster || '',
+            url: videoUrl,
+        };
+    }
+
+    function removeLegacyDoubaoVideos() {
+        const nextVideos = chatVideos.filter(video => video?.source === 'fallback_api');
+        if (nextVideos.length === chatVideos.length) return;
+
+        chatVideos = nextVideos;
+        updateButtonCount();
+        console.log('[无印豆包] 已移除旧 vid/get_play_info 视频，避免下载水印源');
+    }
+
+    function requestJson(url) {
+        return new Promise((resolve, reject) => {
+            if (typeof GM_xmlhttpRequest === 'function') {
+                GM_xmlhttpRequest({
+                    method: 'GET',
+                    url,
+                    headers: {
+                        accept: 'application/json,text/plain,*/*',
+                    },
+                    onload: (response) => {
+                        if (response.status < 200 || response.status >= 300) {
+                            reject(new Error(`请求失败: ${response.status}`));
+                            return;
+                        }
+                        try {
+                            const body = response.responseText || response.response;
+                            resolve(typeof body === 'string' ? JSON.parse(body) : body);
+                        } catch (error) {
+                            reject(error);
+                        }
+                    },
+                    onerror: () => reject(new Error('请求失败')),
+                    ontimeout: () => reject(new Error('请求超时')),
+                });
+                return;
+            }
+
+            originalFetch.call(pageWindow, url, {
+                method: 'GET',
+                credentials: 'omit',
+                headers: {
+                    accept: 'application/json,text/plain,*/*',
+                },
+            })
+                .then(response => response.json())
+                .then(resolve)
+                .catch(reject);
+        });
+    }
+
+    function findDoubaoFallbackApis(json, rawBody = '') {
+        const apis = new Set();
+
+        for (const value of findValuesByKey(json, 'fallback_api')) {
+            addFallbackApi(apis, value);
+        }
+
+        const body = typeof rawBody === 'string' ? rawBody : '';
+        const patterns = [
+            /fallback_api\\":\\"(.*?)\\"/g,
+            /"fallback_api"\s*:\s*"([^"]+)"/g,
+        ];
+
+        for (const pattern of patterns) {
+            let match = pattern.exec(body);
+            while (match) {
+                addFallbackApi(apis, decodeJsonEscapedFragment(match[1]));
+                match = pattern.exec(body);
+            }
+        }
+
+        return Array.from(apis);
+    }
+
+    function addFallbackApi(apis, value) {
+        if (typeof value !== 'string' || !value) return;
+
+        const url = decodeJsonEscapedFragment(value);
+        if (isHttpUrl(url)) {
+            apis.add(url);
+        }
+    }
+
+    function decodeJsonEscapedFragment(value) {
+        let text = value;
+        for (let index = 0; index < 3; index++) {
+            try {
+                const decoded = JSON.parse(`"${text.replace(/"/g, '\\"')}"`);
+                if (decoded === text) break;
+                text = decoded;
+            } catch {
+                break;
+            }
+        }
+        return text.replace(/\\u0026/g, '&').replace(/\\\//g, '/');
+    }
+
+    function replaceQueryParams(url, params) {
+        const parsedUrl = new URL(url);
+        for (const [key, value] of Object.entries(params)) {
+            parsedUrl.searchParams.set(key, value);
+        }
+        return parsedUrl.toString();
+    }
+
+    function getVideoData(payload) {
+        const videoInfo = payload?.video_info || payload?.data?.video_info || payload;
+        const data = videoInfo?.data || videoInfo;
+        return data && typeof data === 'object' ? data : {};
+    }
+
+    function pickMainUrlEntry(data) {
+        const videoList = data?.video_list;
+        const entries = videoList && typeof videoList === 'object' && Object.keys(videoList).length
+            ? Object.values(videoList)
+            : [data];
+        let best = null;
+
+        for (const entry of entries) {
+            if (!entry || typeof entry !== 'object') continue;
+            const token = entry.main_url || entry.play_url || '';
+            if (typeof token !== 'string' || !token.trim()) continue;
+            const score = Number(entry.bitrate || entry.real_bitrate || 0)
+                + Number(entry.vwidth || entry.width || 0) * Number(entry.vheight || entry.height || 0);
+            if (!best || score > best.score) {
+                best = { token: token.trim(), score, entry };
+            }
+        }
+
+        return best;
+    }
+
+    function findKeySeedDeep(value, depth = 0) {
+        if (depth > 10 || value == null) return '';
+
+        if (typeof value === 'string') {
+            let match = value.match(/(?:^|[?&])key_seed=([^&"'<>\\\s]+)/i);
+            if (match) return decodeURIComponent(match[1]);
+            match = value.match(/["']key_seed["']\s*:\s*["']([^"']+)/i);
+            return match ? decodeURIComponent(match[1]) : '';
+        }
+
+        if (typeof value !== 'object') return '';
+
+        if (typeof value.key_seed === 'string' && value.key_seed.trim()) {
+            return value.key_seed.trim();
+        }
+
+        for (const item of Object.values(value)) {
+            const hit = findKeySeedDeep(item, depth + 1);
+            if (hit) return hit;
+        }
+
+        return '';
+    }
+
+    async function decodeMainUrl(token, keySeed = '') {
+        if (isHttpUrl(token)) return token;
+
+        const plainUrl = tryDecodeBase64Url(token);
+        if (plainUrl) return plainUrl;
+
+        if (token.startsWith('qAAB') && keySeed) {
+            return await decodeQaabToken(token, keySeed);
+        }
+
+        return '';
+    }
+
+    function tryDecodeBase64Url(token) {
+        const bytes = base64DecodeLoose(token);
+        if (!bytes) return '';
+        const text = asciiUrlFromBytes(bytes);
+        return isHttpUrl(text) ? text : '';
+    }
+
+    function base64DecodeLoose(text) {
+        const input = String(text || '').trim();
+        const variants = [
+            input,
+            input.replace(/[$@#]/g, char => ({ '$': '_', '@': '/', '#': '.' }[char])),
+            input.replace(/[$@#]/g, char => ({ '$': '+', '@': '/', '#': '=' }[char])),
+        ];
+        const seen = new Set();
+
+        for (const candidate of variants) {
+            if (!candidate || seen.has(candidate)) continue;
+            seen.add(candidate);
+            try {
+                const normalized = padBase64(candidate).replace(/-/g, '+').replace(/_/g, '/');
+                const binary = atob(normalized);
+                const bytes = new Uint8Array(binary.length);
+                for (let index = 0; index < binary.length; index++) {
+                    bytes[index] = binary.charCodeAt(index);
+                }
+                return bytes;
+            } catch {
+                // Try the next variant.
+            }
+        }
+
+        return null;
+    }
+
+    function padBase64(text) {
+        const pad = (4 - (text.length % 4)) % 4;
+        return text + '='.repeat(pad);
+    }
+
+    function asciiUrlFromBytes(bytes) {
+        if (!bytes || !bytes.length) return '';
+        for (const byte of bytes) {
+            if (byte !== 9 && byte !== 10 && byte !== 13 && (byte < 32 || byte > 126)) {
+                return '';
+            }
+        }
+        return new TextDecoder().decode(bytes);
+    }
+
+    async function decodeQaabToken(token, keySeed) {
+        const data = base64DecodeLoose(token);
+        const seed = base64DecodeLoose(keySeed);
+        if (!data || !seed) return '';
+
+        const digest1 = await crypto.subtle.digest('SHA-512', seed.slice(0, 32));
+        const salt = hexToBytes(QAAB_SALT_HEX);
+        const digest2Input = concatBytes(new Uint8Array(digest1), salt);
+        const digest2 = new Uint8Array(await crypto.subtle.digest('SHA-512', digest2Input));
+        const key = digest2.slice(0, 16);
+        const iv = digest2.slice(16, 32);
+        const attempts = [];
+
+        if (data.length >= 4 && data[0] === 0xa8 && data[1] === 0x00 && data[2] === 0x01 && data[3] === 0x00) {
+            attempts.push({ payload: data.slice(4), key, iv });
+            attempts.push({ payload: data.slice(4), key: iv, iv: key });
+            if (data.length > 36) {
+                attempts.push({ payload: data.slice(36), key, iv: data.slice(20, 36) });
+                attempts.push({ payload: data.slice(36), key, iv });
+            }
+        } else {
+            attempts.push({ payload: data, key, iv });
+        }
+
+        for (const attempt of attempts) {
+            const url = await decryptAesCbcUrl(attempt.payload, attempt.key, attempt.iv);
+            if (url) return url;
+        }
+
+        return '';
+    }
+
+    async function decryptAesCbcUrl(payload, keyBytes, ivBytes) {
+        if (!payload.length || payload.length % 16 !== 0) return '';
+
+        try {
+            const key = await crypto.subtle.importKey('raw', keyBytes, 'AES-CBC', false, ['decrypt']);
+            const plain = new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-CBC', iv: ivBytes }, key, payload));
+            const direct = asciiUrlFromBytes(plain);
+            if (isHttpUrl(direct)) return direct;
+            const stripped = stripPkcs7(plain);
+            const url = asciiUrlFromBytes(stripped);
+            return isHttpUrl(url) ? url : '';
+        } catch {
+            return '';
+        }
+    }
+
+    function stripPkcs7(bytes) {
+        if (!bytes || !bytes.length) return new Uint8Array();
+        const pad = bytes[bytes.length - 1];
+        if (pad < 1 || pad > 16 || pad > bytes.length) return bytes;
+        for (let index = bytes.length - pad; index < bytes.length; index++) {
+            if (bytes[index] !== pad) return bytes;
+        }
+        return bytes.slice(0, bytes.length - pad);
+    }
+
+    function hexToBytes(hex) {
+        const bytes = new Uint8Array(hex.length / 2);
+        for (let index = 0; index < bytes.length; index++) {
+            bytes[index] = parseInt(hex.slice(index * 2, index * 2 + 2), 16);
+        }
+        return bytes;
+    }
+
+    function concatBytes(first, second) {
+        const bytes = new Uint8Array(first.length + second.length);
+        bytes.set(first, 0);
+        bytes.set(second, first.length);
+        return bytes;
+    }
+
+    function findValuesByKey(value, targetKey) {
+        const values = [];
+        walkJsonAndStrings(value, (node) => {
+            if (!node || typeof node !== 'object' || Array.isArray(node)) return;
+            if (Object.prototype.hasOwnProperty.call(node, targetKey)) {
+                values.push(node[targetKey]);
+            }
+        });
+        return values;
+    }
+
+    function walkJsonAndStrings(value, visitor, seen = new Set()) {
+        if (value == null) return;
+
+        if (typeof value === 'string') {
+            const parsed = parseJsonString(value);
+            if (parsed !== null) {
+                walkJsonAndStrings(parsed, visitor, seen);
+            }
+            return;
+        }
+
+        if (typeof value !== 'object' || seen.has(value)) return;
+
+        seen.add(value);
+        visitor(value);
+
+        if (Array.isArray(value)) {
+            for (const item of value) {
+                walkJsonAndStrings(item, visitor, seen);
+            }
+            return;
+        }
+
+        for (const key of Object.keys(value)) {
+            walkJsonAndStrings(value[key], visitor, seen);
+        }
+    }
+
+    function parseJsonString(text) {
+        const trimmed = text.trim();
+        if (!trimmed || (!trimmed.startsWith('{') && !trimmed.startsWith('['))) {
+            return null;
+        }
+
+        try {
+            return JSON.parse(trimmed);
+        } catch {
+            return null;
+        }
+    }
+
+    function isHttpUrl(url) {
+        return typeof url === 'string' && /^https?:\/\//i.test(url);
+    }
+
     function parseChatHistoryImages(messages) {
         if (!Array.isArray(messages)) return;
 
@@ -469,8 +907,7 @@
                         if (!creationBlock || !Array.isArray(creationBlock.creations)) continue;
                         for (const creation of creationBlock.creations) {
                             if (creation?.video) {
-                                const vid = creation.video.vid;
-                                getDoubaoVideoInfo(vid).then(info => addChatVideo(info));
+                                handleDoubaoCreationVideo(creation);
                             }else{
                                 if (addChatImage(getCreationImageInfo(creation), '[无印豆包] 找到图片')) {
                                     addedCount++;
@@ -499,8 +936,7 @@
 
             const addCreationMedia = (creation) => {
                 if (creation?.video) {
-                    const vid = creation.video.vid;
-                    getDoubaoVideoInfo(vid).then(info => addChatVideo(info));
+                    handleDoubaoCreationVideo(creation);
                     return;
                 }
 
@@ -582,6 +1018,7 @@
                 if (dataFnArgs) {
                     const jsonStr = dataFnArgs.replace(/&quot;/g, '"');
                     const jsonData = JSON.parse(jsonStr);
+                    processDoubaoFallbackVideos(jsonData, jsonStr);
 
                     for (const data of jsonData) {
                         parseRouterDataItem(data);
